@@ -1,0 +1,129 @@
+#!/bin/bash
+
+SOCKET_PATH="/tmp/mpv-socket"
+
+# 1. Cleanup function
+cleanup() {
+  echo -e "\n🧹 Cleaning up..."
+  kill "$MPV_PID" 2>/dev/null
+  rm -f "$SOCKET_PATH"
+  stty sane
+  exit
+}
+
+# 2. Trap termination signals
+trap cleanup SIGINT SIGTERM SIGHUP EXIT
+
+# 3. Search YouTube and return results as JSON
+search_youtube() {
+  local query="$1"
+  yt-dlp --cookies cookies.txt "ytsearch5:$query" --lazy-playlist --flat-playlist --print-json --skip-download | jq -s '.'
+}
+
+# 4. Display titles
+display_titles() {
+  local json="$1"
+  echo -e "🎵 Options:"
+  jq -r '.[] | "\(.title) | [\(.duration_string // "N/A")]"' <<< "$json" | nl -w2 -s'. '
+}
+
+# 5. Get user's selection
+get_selection() {
+  read -n1 -p $'Enter number to play (1-5): ' num
+  echo
+  if [[ "$num" =~ ^[1-5]$ ]]; then
+    echo "$((num - 1))"
+  else
+    echo "-1"
+  fi
+}
+
+# 6. Extract audio URL for selected video
+get_audio_url() {
+  local video_id="$1"
+  yt-dlp --cookies cookies.txt -f bestaudio --no-playlist --lazy-playlist --flat-playlist --get-url "https://www.youtube.com/watch?v=$video_id"
+}
+
+# 7. Start playback in background
+start_playback() {
+  local url="$1"
+  mpv --no-video \
+      --quiet --really-quiet \
+      --input-ipc-server="$SOCKET_PATH" "$url" >/dev/null 2>&1 &
+  MPV_PID=$!
+}
+
+# 8. Show now playing info
+show_now_playing() {
+  local json="$1"
+  local index="$2"
+  jq -r ".[$index] | \"\n▶️ Now Playing: \(.title) | [\(.duration_string // \"N/A\")]\"" <<< "$json"
+  echo "Controls: [p]ause/resume | [q]uit"
+}
+
+# 9. Control loop
+handle_controls() {
+  while kill -0 $MPV_PID 2>/dev/null; do
+    read -rsn1 key
+    case "$key" in
+      p)
+        printf '%s\n' '{"command": ["cycle", "pause"]}' | nc -U -w 1 "$SOCKET_PATH" >/dev/null 2>&1
+        ;;
+      q)
+        printf '%s\n' '{"command": ["quit"]}' | nc -U -w 1 "$SOCKET_PATH" >/dev/null 2>&1
+        break
+        ;;
+      [1-5])
+        local idx=$((key - 1))
+        local next_id=$(jq -r ".[$idx].id" <<< "$RESULTS")
+        if [ -n "$next_id" ]; then
+          QUEUE="$next_id"
+          local title=$(jq -r ".[$idx].title" <<< "$RESULTS")
+          echo -e "\n📥 Queued: $title"
+        fi
+    esac
+  done
+}
+
+# 10. Main script
+main() {
+  if [ -z "$1" ]; then
+    echo "Usage: $0 <search query>"
+    exit 1
+  fi
+
+  QUERY="$*"
+  RESULTS=$(search_youtube "$QUERY")
+  display_titles "$RESULTS"
+
+  INDEX=$(get_selection)
+  if [ "$INDEX" -lt 0 ]; then
+    echo "❌ Invalid selection."
+    exit 1
+  fi
+
+  local current_id=$(jq -r ".[$INDEX].id" <<< "$RESULTS")
+
+  while true; do
+    local audio_url=$(get_audio_url "$current_id")
+    start_playback "$audio_url"
+    show_now_playing "$RESULTS" "$INDEX"
+    
+    # RESULTS=$(yt-dlp --cookies cookies.txt --print-json --skip-download "ytsearch5::ytrec:$current_id" | jq -s '.')
+    # echo "$RESULTS" > output.json
+    
+    display_titles "$RESULTS"
+    handle_controls "$RESULTS" current_id
+
+    if [ -n "$QUEUE" ]; then
+      current_id="$QUEUE"
+      QUEUE=""
+      INDEX=0
+    else
+      echo "❌ No queued song. Exiting."
+      break
+    fi
+  done
+}
+
+main "$@"
